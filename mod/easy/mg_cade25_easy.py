@@ -1397,6 +1397,12 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
                 gi = float(mask_inside)
                 go = float(mask_outside)
                 gain = g * gi + (1.0 - g) * go  # [B,1,H,W]
+                # Clamp mask gain to avoid amplitude spikes
+                mgmin = float(globals().get("CADE_MASK_GAIN_MIN", 0.0))
+                mgmax = float(globals().get("CADE_MASK_GAIN_MAX", 1.0))
+                if mgmax < mgmin:
+                    mgmax = mgmin
+                gain = gain.clamp(min=mgmin, max=mgmax)
                 return gain
             except Exception:
                 return None
@@ -1559,6 +1565,28 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
             cond = uncond + delta
         else:
             prev_delta["t"] = delta.detach()
+        # ---- safety utilities: RMS cap and optional quantile clip ----
+        def _rms(x: torch.Tensor) -> torch.Tensor:
+            return x.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt()
+
+        def _rescale_down_to_pos(cfg: torch.Tensor, pos: torch.Tensor, cap: float) -> torch.Tensor:
+            # ensure ||cfg||_rms <= cap * ||pos||_rms  (per-sample)
+            rms_cfg = _rms(cfg).clamp_min(1e-6)
+            rms_pos = _rms(pos).clamp_min(1e-6)
+            g = torch.minimum(torch.ones_like(rms_cfg), float(cap) * rms_pos / rms_cfg)
+            return cfg * g
+
+        def _qclip(cfg: torch.Tensor, q: float) -> torch.Tensor:
+            try:
+                thr = torch.quantile(cfg.abs().float(), q, dim=(1, 2, 3), keepdim=True)
+                return torch.clamp(cfg, -thr, thr)
+            except Exception:
+                return cfg
+
+        SAFE_RMS_CAP = float(globals().get("CADE_SAFE_RMS_CAP", 1.25))
+        SAFE_QCLIP_EN = bool(globals().get("CADE_SAFE_QCLIP_ENABLE", False))
+        SAFE_Q = float(globals().get("CADE_SAFE_Q", 0.999))
+
         # After momentum: optionally apply FDG and rebuild cond
         if (not is_lcm_stepper) and mode in ("RescaleFDG", "ZeResFDG"):
             # Adaptive low gain if enabled
@@ -1624,35 +1652,35 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
 
         if sigma is None or x_orig is None:
             return uncond + cond_scale * (cond - uncond)
-        # Rescale in native space; for LCM stepper, disable RescaleCFG
+        # Native-space mix with safety caps before any optional rescale
         if is_v_pred:
-            # Rescale in v-space and return v
+            # v-space path
             v_cond, v_uncond = cond, uncond
             v_cfg = v_uncond + cond_scale_eff * (v_cond - v_uncond)
             ro_pos = torch.std(v_cond, dim=(1, 2, 3), keepdim=True)
             ro_cfg = torch.std(v_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-            if is_lcm_stepper:
-                v_final = v_cfg  # no rescale for LCM stepper
-            else:
+            # Always apply RMS cap; optional quantile clip
+            v_cfg = _rescale_down_to_pos(v_cfg, v_cond, SAFE_RMS_CAP)
+            if SAFE_QCLIP_EN:
+                v_cfg = _qclip(v_cfg, SAFE_Q)
+            if not is_lcm_stepper:
                 v_rescaled = v_cfg * (ro_pos / ro_cfg)
-                v_final = float(rescale_multiplier) * v_rescaled + (1.0 - float(rescale_multiplier)) * v_cfg
-            return v_final
+                v_cfg = float(rescale_multiplier) * v_rescaled + (1.0 - float(rescale_multiplier)) * v_cfg
+            return v_cfg
         else:
-            # Rescale in ε-space and return ε
+            # ε-space path
             eps_cond, eps_uncond = cond, uncond
             eps_cfg = eps_uncond + cond_scale_eff * (eps_cond - eps_uncond)
             ro_pos = torch.std(eps_cond, dim=(1, 2, 3), keepdim=True)
             ro_cfg = torch.std(eps_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-            if is_lcm_stepper:
-                # No rescale, no ε-boost. Optional clamp for rare outliers.
-                if bool(globals().get("CADE_LCM_EPS_CLIP_ENABLE", False)):
-                    k = float(globals().get("CADE_LCM_EPS_CLIP_VALUE", 3.0))
-                    return torch.clamp(eps_cfg, -k, k)
-                return eps_cfg
-            else:
+            # Always apply RMS cap; optional quantile clip
+            eps_cfg = _rescale_down_to_pos(eps_cfg, eps_cond, SAFE_RMS_CAP)
+            if SAFE_QCLIP_EN:
+                eps_cfg = _qclip(eps_cfg, SAFE_Q)
+            if not is_lcm_stepper:
                 eps_rescaled = eps_cfg * (ro_pos / ro_cfg)
-                eps_final = float(rescale_multiplier) * eps_rescaled + (1.0 - float(rescale_multiplier)) * eps_cfg
-                return eps_final * float(eps_mult)
+                eps_cfg = float(rescale_multiplier) * eps_rescaled + (1.0 - float(rescale_multiplier)) * eps_cfg
+            return eps_cfg * float(eps_mult)
 
     m.set_model_sampler_cfg_function(cfg_func, disable_cfg1_optimization=True)
 
