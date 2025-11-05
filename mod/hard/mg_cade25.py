@@ -965,6 +965,70 @@ def _fdg_energy_fraction(delta: torch.Tensor, sigma: float = 1.0, radius: int = 
     return frac
 
 
+def _rms(x: torch.Tensor) -> torch.Tensor:
+    return x.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt()
+
+
+def _dacfg_native(pred_pos: torch.Tensor,
+                  pred_neg: torch.Tensor,
+                  scale: torch.Tensor | float,
+                  sigma: torch.Tensor,
+                  x_in: torch.Tensor,
+                  ms,
+                  cap: float) -> torch.Tensor:
+    """Denoised-anchored CFG: shrink per-sample scale so x0_cfg RMS <= cap * x0_pos RMS."""
+    try:
+        sigma_in = sigma.view(sigma.shape[:1] + (1,) * (x_in.ndim - 1))
+
+        # base cfg at requested scale
+        cfg = pred_neg + float(scale) * (pred_pos - pred_neg)
+
+        # denoised x0 for pos and current cfg
+        x0_pos = ms.calculate_denoised(sigma_in, pred_pos, x_in)
+        x0_cfg = ms.calculate_denoised(sigma_in, cfg, x_in)
+
+        # cumulative scale factor (per-sample)
+        scale_fac = torch.ones_like(_rms(x0_pos))
+
+        # RMS guard
+        r_pos = _rms(x0_pos).clamp_min(1e-6)
+        r_cfg = _rms(x0_cfg).clamp_min(1e-6)
+        g = torch.minimum(torch.ones_like(r_cfg), cap * r_pos / r_cfg)
+        scale_fac = torch.minimum(scale_fac, g)
+
+        # Quantile guard (optional, catches localized spikes)
+        if bool(globals().get("CADE_X0_QCAP_ENABLE", True)):
+            q = float(globals().get("CADE_X0_Q", 0.998))
+            q = max(0.90, min(0.9999, q))
+            qc = float(globals().get("CADE_X0_QCAP", 1.06))
+            # reuse x0_pos/x0_cfg from above
+            try:
+                qpos = torch.quantile(x0_pos.abs().float(), q, dim=(1, 2, 3), keepdim=True).clamp_min(1e-8)
+                qcfg = torch.quantile(x0_cfg.abs().float(), q, dim=(1, 2, 3), keepdim=True).clamp_min(1e-8)
+            except Exception:
+                qpos = torch.quantile(
+                    x0_pos.abs().float().view(x0_pos.shape[0], -1),
+                    q,
+                    dim=1,
+                    keepdim=True,
+                ).view(-1, 1, 1, 1).clamp_min(1e-8)
+                qcfg = torch.quantile(
+                    x0_cfg.abs().float().view(x0_cfg.shape[0], -1),
+                    q,
+                    dim=1,
+                    keepdim=True,
+                ).view(-1, 1, 1, 1).clamp_min(1e-8)
+            qg = torch.minimum(torch.ones_like(qcfg), (qc * qpos) / qcfg)
+            scale_fac = torch.minimum(scale_fac, qg)
+
+        # apply once
+        if (scale_fac < 0.999).any():
+            cfg = pred_neg + (float(scale) * scale_fac) * (pred_pos - pred_neg)
+    except Exception:
+        cfg = pred_neg + float(scale) * (pred_pos - pred_neg)
+    return cfg
+
+
 def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: float, momentum_beta: float, cfg_curve: float, perp_damp: float, use_zero_init: bool=False, zero_init_steps: int=0, fdg_low: float = 0.6, fdg_high: float = 1.3, fdg_sigma: float = 1.0, ze_zero_steps: int = 0, ze_adaptive: bool = False, ze_r_switch_hi: float = 0.6, ze_r_switch_lo: float = 0.45, fdg_low_adaptive: bool = False, fdg_low_min: float = 0.45, fdg_low_max: float = 0.7, fdg_ema_beta: float = 0.8, use_local_mask: bool = False, mask_inside: float = 1.0, mask_outside: float = 1.0,
                                 midfreq_enable: bool = False, midfreq_gain: float = 0.0, midfreq_sigma_lo: float = 0.8, midfreq_sigma_hi: float = 2.0,
                                 mahiro_plus_enable: bool = False, mahiro_plus_strength: float = 0.5,
@@ -1146,9 +1210,6 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
         else:
             prev_delta["t"] = delta.detach()
         # ---- safety utilities: RMS cap and optional quantile clip ----
-        def _rms(x: torch.Tensor) -> torch.Tensor:
-            return x.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt()
-
         def _rescale_down_to_pos(cfg: torch.Tensor, pos: torch.Tensor, cap: float) -> torch.Tensor:
             rms_cfg = _rms(cfg).clamp_min(1e-6)
             rms_pos = _rms(pos).clamp_min(1e-6)
@@ -1259,28 +1320,43 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
             # v-space path
             v_cond, v_uncond = cond, uncond
             v_cfg = v_uncond + cond_scale_eff * (v_cond - v_uncond)
-            ro_pos = torch.std(v_cond, dim=(1, 2, 3), keepdim=True)
-            ro_cfg = torch.std(v_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-            v_cfg = _rescale_down_to_pos(v_cfg, v_cond, SAFE_RMS_CAP)
-            if SAFE_QCLIP_EN:
-                v_cfg = _qclip(v_cfg, SAFE_Q)
-            if not is_lcm_stepper:
-                v_rescaled = v_cfg * (ro_pos / ro_cfg)
-                v_cfg = float(rescale_multiplier) * v_rescaled + (1.0 - float(rescale_multiplier)) * v_cfg
+            cap = float(globals().get("CADE_X0_RMS_CAP", 1.10))
+            ms = getattr(m, "model_sampling", None)
+            DACFG_ON = (ms is not None) and (sigma is not None) and (x_orig is not None)
+            if DACFG_ON:
+                v_cfg = _dacfg_native(v_cond, v_uncond, cond_scale_eff, sigma, x_orig, ms, cap)
+            if (not DACFG_ON) or (not bool(globals().get("CADE_DISABLE_PSPACE_RMS_WHEN_DACFG", True))):
+                v_cfg = _rescale_down_to_pos(v_cfg, v_cond, SAFE_RMS_CAP)
+                if SAFE_QCLIP_EN:
+                    v_cfg = _qclip(v_cfg, SAFE_Q)
+            if (not is_lcm_stepper) and (not bool(globals().get("CADE_DISABLE_RESCALE_WHEN_DACFG", True))):
+                ro_pos = torch.var(v_cond, dim=(1, 2, 3), correction=0, keepdim=True).clamp_min(0).sqrt()
+                ro_cfg = torch.var(v_cfg, dim=(1, 2, 3), correction=0, keepdim=True).clamp_min(1e-12).sqrt()
+                v_cfg = float(rescale_multiplier) * (v_cfg * (ro_pos / ro_cfg)) + (1.0 - float(rescale_multiplier)) * v_cfg
             return v_cfg
         else:
             # ε-space path
             eps_cond, eps_uncond = cond, uncond
-            eps_cfg = eps_uncond + cond_scale_eff * (eps_cond - eps_uncond)
-            ro_pos = torch.std(eps_cond, dim=(1, 2, 3), keepdim=True)
-            ro_cfg = torch.std(eps_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-            eps_cfg = _rescale_down_to_pos(eps_cfg, eps_cond, SAFE_RMS_CAP)
-            if SAFE_QCLIP_EN:
-                eps_cfg = _qclip(eps_cfg, SAFE_Q)
-            if not is_lcm_stepper:
-                eps_rescaled = eps_cfg * (ro_pos / ro_cfg)
-                eps_cfg = float(rescale_multiplier) * eps_rescaled + (1.0 - float(rescale_multiplier)) * eps_cfg
-            return eps_cfg * float(eps_mult)
+            eps_cond_m = eps_cond * float(eps_mult)
+            eps_uncond_m = eps_uncond * float(eps_mult)
+            eps_cfg = eps_uncond_m + cond_scale_eff * (eps_cond_m - eps_uncond_m)
+
+            cap = float(globals().get("CADE_X0_RMS_CAP", 1.10))
+            ms = getattr(m, "model_sampling", None)
+            DACFG_ON = (ms is not None) and (sigma is not None) and (x_orig is not None)
+            if DACFG_ON:
+                eps_cfg = _dacfg_native(eps_cond_m, eps_uncond_m, cond_scale_eff, sigma, x_orig, ms, cap)
+
+            if (not DACFG_ON) or (not bool(globals().get("CADE_DISABLE_PSPACE_RMS_WHEN_DACFG", True))):
+                eps_cfg = _rescale_down_to_pos(eps_cfg, eps_cond_m, SAFE_RMS_CAP)
+                if SAFE_QCLIP_EN:
+                    eps_cfg = _qclip(eps_cfg, SAFE_Q)
+
+            if (not is_lcm_stepper) and (not bool(globals().get("CADE_DISABLE_RESCALE_WHEN_DACFG", True))):
+                ro_pos = torch.var(eps_cond_m, dim=(1, 2, 3), correction=0, keepdim=True).clamp_min(0).sqrt()
+                ro_cfg = torch.var(eps_cfg, dim=(1, 2, 3), correction=0, keepdim=True).clamp_min(1e-12).sqrt()
+                eps_cfg = float(rescale_multiplier) * (eps_cfg * (ro_pos / ro_cfg)) + (1.0 - float(rescale_multiplier)) * eps_cfg
+            return eps_cfg
 
     m.set_model_sampler_cfg_function(cfg_func, disable_cfg1_optimization=True)
 
