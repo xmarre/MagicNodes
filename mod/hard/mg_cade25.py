@@ -1167,9 +1167,18 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
                 gain = gain.mean().item()
             cond_scale_eff = cond_scale * float(gain)
 
+        # Detect native prediction space so we avoid unnecessary conversions
+        pred_param = "eps"
+        try:
+            ms = getattr(m, "model_sampling", None)
+            pred_param = str(getattr(ms, "parameterization", "eps")).lower()
+        except Exception:
+            pass
+        is_v_pred = pred_param.startswith("v")
+
         # Epsilon scaling (exposure bias correction): early steps get multiplier closer to (1 + eps_scale)
         eps_mult = 1.0
-        if bool(eps_scale_enable) and (sigma is not None):
+        if (not is_v_pred) and bool(eps_scale_enable) and (sigma is not None):
             try:
                 s = sigma
                 if s.ndim > 1:
@@ -1195,13 +1204,21 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
             return uncond + cond_scale * (cond - uncond)
         sigma_ = sigma.view(sigma.shape[:1] + (1,) * (cond.ndim - 1))
         x = x_orig / (sigma_ * sigma_ + 1.0)
-        v_cond = ((x - (x_orig - cond)) * (sigma_ ** 2 + 1.0) ** 0.5) / (sigma_)
-        v_uncond = ((x - (x_orig - uncond)) * (sigma_ ** 2 + 1.0) ** 0.5) / (sigma_)
+
+        if is_v_pred:
+            v_cond = cond
+            v_uncond = uncond
+        else:
+            v_cond = ((x - (x_orig - cond)) * (sigma_ ** 2 + 1.0) ** 0.5) / (sigma_)
+            v_uncond = ((x - (x_orig - uncond)) * (sigma_ ** 2 + 1.0) ** 0.5) / (sigma_)
         v_cfg = v_uncond + cond_scale_eff * (v_cond - v_uncond)
         ro_pos = torch.std(v_cond, dim=(1, 2, 3), keepdim=True)
         ro_cfg = torch.std(v_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
         v_rescaled = v_cfg * (ro_pos / ro_cfg)
         v_final = float(rescale_multiplier) * v_rescaled + (1.0 - float(rescale_multiplier)) * v_cfg
+        if is_v_pred:
+            # Return in native prediction space to avoid rescaling artifacts with v-pred samplers.
+            return v_final
         eps = x_orig - (x - (v_final * eps_mult) * sigma_ / (sigma_ * sigma_ + 1.0) ** 0.5)
         return eps
 
