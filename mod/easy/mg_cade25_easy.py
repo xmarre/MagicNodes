@@ -1359,6 +1359,29 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
         sigma = args.get("sigma", None)
         x_orig = args.get("input", None)
 
+        # --- detect LCM stepper early (so we can gate FDG/midfreq) ---
+
+        def _get(d, *keys, default=""):
+            for k in keys:
+                if not isinstance(d, dict):
+                    return default
+                d = d.get(k, None)
+            return d if d is not None else default
+
+        sampler_tag = str(
+            _get(args, "sampler_name")
+            or _get(args, "sampler")
+            or _get(args, "model_options", "sampler_name")
+            or _get(args, "model_options", "transformer_options", "sampler_name")
+            or ""
+        ).lower()
+        is_lcm_stepper = ("lcm" in sampler_tag)
+
+        def _cap_cfg(val):
+            if is_lcm_stepper:
+                return float(min(float(val), 1.8))
+            return val
+
         # Local spatial gain from CURRENT_ONNX_MASK_BCHW, resized to cond spatial size
         def _local_gain_for(hw):
             if not bool(use_local_mask):
@@ -1379,7 +1402,7 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
                 return None
 
         # Compute effective cond scale before any branch, so schedules apply in all modes
-        cond_scale_eff = cond_scale
+        cond_scale_eff = _cap_cfg(cond_scale)
         curve_gain = 1.0
         if cfg_curve > 0.0 and (sigma is not None):
             s = sigma
@@ -1403,7 +1426,7 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
             if g.ndim > 0:
                 g = g.mean().item()
             curve_gain = float(g)
-            cond_scale_eff = cond_scale * curve_gain
+            cond_scale_eff = _cap_cfg(cond_scale * curve_gain)
 
         if isinstance(cfg_sched_type, str) and cfg_sched_type.lower() != "off" and (sigma is not None):
             try:
@@ -1442,7 +1465,7 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
                     cfg_val = cmin + (cmax - cmin) * e
                 else:
                     cfg_val = cond_scale_eff
-                cond_scale_eff = float(cfg_val) * float(curve_gain)
+                cond_scale_eff = _cap_cfg(float(cfg_val) * float(curve_gain))
             except Exception:
                 pass
         # Allow hybrid switch per-step
@@ -1511,8 +1534,8 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
                 low_gain_eff = max(0.0, min(2.0, lmin + (lmax - lmin) * s))
             if mode == "CFGZeroFD":
                 resid = _fdg_filter(resid, low_gain=low_gain_eff, high_gain=fdg_high, sigma=float(fdg_sigma), radius=1)
-            # Apply local spatial gain to residual guidance
-            lg = _local_gain_for((cond.shape[-2], cond.shape[-1]))
+            # Apply local spatial gain to residual guidance (skip on LCM)
+            lg = None if is_lcm_stepper else _local_gain_for((cond.shape[-2], cond.shape[-1]))
             if lg is not None:
                 resid = resid * lg.expand(-1, resid.shape[1], -1, -1)
             noise_pred = uncond * alpha + cond_scale_eff * resid
@@ -1520,14 +1543,14 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
 
         # RescaleCFG/FDG path (with optional momentum/perp damping and S-curve shaping)
         delta = cond - uncond
-        pd = float(max(0.0, min(1.0, perp_damp)))
+        pd = 0.0 if is_lcm_stepper else float(max(0.0, min(1.0, perp_damp)))
         if pd > 0.0 and (prev_delta["t"] is not None) and (prev_delta["t"].shape == delta.shape):
             prev = prev_delta["t"]
             denom = (prev * prev).sum(dim=(1,2,3), keepdim=True).clamp_min(1e-6)
             coeff = ((delta * prev).sum(dim=(1,2,3), keepdim=True) / denom)
             parallel = coeff * prev
             delta = delta - pd * parallel
-        beta = float(max(0.0, min(0.95, momentum_beta)))
+        beta = 0.0 if is_lcm_stepper else float(max(0.0, min(0.95, momentum_beta)))
         if beta > 0.0:
             if prev_delta["t"] is None or prev_delta["t"].shape != delta.shape:
                 prev_delta["t"] = delta.detach()
@@ -1537,7 +1560,7 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
         else:
             prev_delta["t"] = delta.detach()
         # After momentum: optionally apply FDG and rebuild cond
-        if mode == "RescaleFDG":
+        if (not is_lcm_stepper) and mode in ("RescaleFDG", "ZeResFDG"):
             # Adaptive low gain if enabled
             low_gain_eff = float(fdg_low)
             if bool(fdg_low_adaptive) and spec_state["ema"] is not None:
@@ -1558,14 +1581,15 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
                 delta_fdg = delta_fdg * lg.expand(-1, delta_fdg.shape[1], -1, -1)
             cond = uncond + delta_fdg
         else:
-            lg = _local_gain_for((cond.shape[-2], cond.shape[-1]))
+            # On LCM stepper do not apply any spatial gain to avoid amplitude spikes
+            lg = None if is_lcm_stepper else _local_gain_for((cond.shape[-2], cond.shape[-1]))
             if lg is not None:
                 delta = delta * lg.expand(-1, delta.shape[1], -1, -1)
             cond = uncond + delta
 
         
 
-        # Detect native prediction space so we avoid unnecessary conversions
+        # Detect native prediction space once
         pred_param = "eps"
         try:
             ms = getattr(m, "model_sampling", None)
@@ -1576,7 +1600,7 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
 
         # Epsilon scaling (exposure bias correction): early steps get multiplier closer to (1 + eps_scale)
         eps_mult = 1.0
-        if (not is_v_pred) and bool(eps_scale_enable) and (sigma is not None):
+        if (not is_v_pred) and (not is_lcm_stepper) and bool(eps_scale_enable) and (sigma is not None):
             try:
                 s = sigma
                 if s.ndim > 1:
@@ -1600,26 +1624,35 @@ def _wrap_model_with_guidance(model, guidance_mode: str, rescale_multiplier: flo
 
         if sigma is None or x_orig is None:
             return uncond + cond_scale * (cond - uncond)
-        sigma_ = sigma.view(sigma.shape[:1] + (1,) * (cond.ndim - 1))
-        x = x_orig / (sigma_ * sigma_ + 1.0)
-
+        # Rescale in native space; for LCM stepper, disable RescaleCFG
         if is_v_pred:
-            v_cond = cond
-            v_uncond = uncond
-        else:
-            v_cond = ((x - (x_orig - cond)) * (sigma_ ** 2 + 1.0) ** 0.5) / (sigma_)
-            v_uncond = ((x - (x_orig - uncond)) * (sigma_ ** 2 + 1.0) ** 0.5) / (sigma_)
-        v_cfg = v_uncond + cond_scale_eff * (v_cond - v_uncond)
-        ro_pos = torch.std(v_cond, dim=(1, 2, 3), keepdim=True)
-        ro_cfg = torch.std(v_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-        v_rescaled = v_cfg * (ro_pos / ro_cfg)
-        v_final = float(rescale_multiplier) * v_rescaled + (1.0 - float(rescale_multiplier)) * v_cfg
-        # Return in native prediction space to avoid scale blow-ups with v-pred samplers (LCM).
-        if is_v_pred:
+            # Rescale in v-space and return v
+            v_cond, v_uncond = cond, uncond
+            v_cfg = v_uncond + cond_scale_eff * (v_cond - v_uncond)
+            ro_pos = torch.std(v_cond, dim=(1, 2, 3), keepdim=True)
+            ro_cfg = torch.std(v_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+            if is_lcm_stepper:
+                v_final = v_cfg  # no rescale for LCM stepper
+            else:
+                v_rescaled = v_cfg * (ro_pos / ro_cfg)
+                v_final = float(rescale_multiplier) * v_rescaled + (1.0 - float(rescale_multiplier)) * v_cfg
             return v_final
-        # epsilon path (DDIM, Euler, etc.)
-        eps = x_orig - (x - (v_final * eps_mult) * sigma_ / (sigma_ * sigma_ + 1.0) ** 0.5)
-        return eps
+        else:
+            # Rescale in ε-space and return ε
+            eps_cond, eps_uncond = cond, uncond
+            eps_cfg = eps_uncond + cond_scale_eff * (eps_cond - eps_uncond)
+            ro_pos = torch.std(eps_cond, dim=(1, 2, 3), keepdim=True)
+            ro_cfg = torch.std(eps_cfg, dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+            if is_lcm_stepper:
+                # No rescale, no ε-boost. Optional clamp for rare outliers.
+                if bool(globals().get("CADE_LCM_EPS_CLIP_ENABLE", False)):
+                    k = float(globals().get("CADE_LCM_EPS_CLIP_VALUE", 3.0))
+                    return torch.clamp(eps_cfg, -k, k)
+                return eps_cfg
+            else:
+                eps_rescaled = eps_cfg * (ro_pos / ro_cfg)
+                eps_final = float(rescale_multiplier) * eps_rescaled + (1.0 - float(rescale_multiplier)) * eps_cfg
+                return eps_final * float(eps_mult)
 
     m.set_model_sampler_cfg_function(cfg_func, disable_cfg1_optimization=True)
 
